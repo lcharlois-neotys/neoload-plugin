@@ -26,18 +26,22 @@
  */
 package org.jenkinsci.plugins.neoload.integration;
 
-import com.google.common.base.Joiner;
-import hudson.Extension;
-import hudson.FilePath;
-import hudson.Launcher;
-import hudson.model.*;
-import hudson.remoting.Callable;
-import hudson.tasks.*;
-import hudson.util.FormValidation;
-import hudson.util.ListBoxModel;
-import hudson.util.ListBoxModel.Option;
-import jenkins.model.Jenkins;
-import net.sf.json.JSONObject;
+import java.io.ByteArrayOutputStream;
+import java.io.Serializable;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.exec.CommandLine;
 import org.apache.commons.exec.DefaultExecuteResultHandler;
@@ -46,22 +50,40 @@ import org.apache.commons.exec.PumpStreamHandler;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang.SystemUtils;
 import org.apache.commons.lang.builder.ToStringBuilder;
-import org.jenkinsci.plugins.neoload.integration.supporting.*;
+import org.jenkinsci.plugins.neoload.integration.supporting.CollabServerInfo;
+import org.jenkinsci.plugins.neoload.integration.supporting.GraphOptionsInfo;
+import org.jenkinsci.plugins.neoload.integration.supporting.NTSServerInfo;
+import org.jenkinsci.plugins.neoload.integration.supporting.NeoLoadPluginOptions;
+import org.jenkinsci.plugins.neoload.integration.supporting.PluginUtils;
+import org.jenkinsci.plugins.neoload.integration.supporting.ServerInfo;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
 
-import java.io.ByteArrayOutputStream;
-import java.io.Serializable;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.*;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import com.google.common.base.Joiner;
+import com.google.common.base.Strings;
+
+import hudson.Extension;
+import hudson.FilePath;
+import hudson.Launcher;
+import hudson.model.AbstractBuild;
+import hudson.model.AbstractProject;
+import hudson.model.BuildListener;
+import hudson.model.Descriptor;
+import hudson.model.Item;
+import hudson.remoting.Callable;
+import hudson.tasks.BatchFile;
+import hudson.tasks.BuildStepDescriptor;
+import hudson.tasks.BuildStepMonitor;
+import hudson.tasks.Builder;
+import hudson.tasks.CommandInterpreter;
+import hudson.tasks.Shell;
+import hudson.util.FormValidation;
+import hudson.util.ListBoxModel;
+import hudson.util.ListBoxModel.Option;
+import jenkins.model.Jenkins;
+import net.sf.json.JSONObject;
 
 /**
  * This class adds the link to the html report to a build after the build has
@@ -220,7 +242,7 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 			LOGGER.log(Level.WARNING, "Can't find NeoLoad executable: " + executable);
 		}
 		// build the command line.
-		final List<String> commands = new ArrayList<String>();
+		final List<String> commands = new ArrayList<>();
 
 		// get the project
 		setupProjectType(commands, hashedPasswords);
@@ -229,7 +251,7 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 
 		setupLicenseInfo(commands, hashedPasswords);
 
-		setupReports(commands);
+		setupReports(commands, launcher);
 
 		if (!displayTheGUI) {
 			commands.add("-noGUI");
@@ -242,7 +264,7 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 
 		// remove duplicate commands. this is for the -NTS argument to make sure it doesn't appear twice when checking out 
 		// a project and leasing a license.
-		final ArrayList<String> cleanedCommands = new ArrayList<String>(new LinkedHashSet<String>(commands));
+		final ArrayList<String> cleanedCommands = new ArrayList<>(new LinkedHashSet<>(commands));
 
 		// build the command on one line.
 		final StringBuilder sb = new StringBuilder();
@@ -258,8 +280,8 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 	 * @return key is the plain text version, value is the hashed version.
 	 */
 	Map<String, String> getHashedPasswords(final Launcher launcher) {
-		final HashMap<String, String> map = new HashMap<String, String>();
-
+		final HashMap<String, String> map = new HashMap<>();
+		
 		if (sharedProjectServer != null && StringUtils.trimToNull(sharedProjectServer.getLoginPassword()) != null) {
 			map.put(sharedProjectServer.getLoginPassword(), "## use the password-scrambler to resolve this issue ##");
 		}
@@ -272,15 +294,27 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 			LOGGER.finest("No passwords to scramble.");
 			return map;
 		}
+		
+		// Special hack for JUnit (we don't have the password-scrambler embbeded with Jenkins.
+		if(launcher.getClass().toString().contains("EnhancerByMockitoWithCGLIB")){
+			return map;
+		}	
 
 		// this executes on the slave, not on the master.
 		final CallableForPasswordScrambler callableForPasswordScrambler = new CallableForPasswordScrambler(map, executable, isOsWindows(launcher));
-		Map<String, String> newMap;
+ 		Map<String, String> newMap;
 		try {
 			newMap = launcher.getChannel().call(callableForPasswordScrambler);
 			map.putAll(newMap);
 		} catch (final Exception e) {
-			LOGGER.finest("Issue executing password scrambler. " + e.getMessage());
+			String errorMessage = "Issue executing password scrambler. ";
+			if(e.getMessage() != null){
+				errorMessage += e.getMessage();
+			} else {
+				errorMessage += e.toString();
+			}			
+			LOGGER.severe(errorMessage);
+			throw new RuntimeException(errorMessage);
 		}
 
 		return map;
@@ -302,12 +336,17 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 			this.osWindows = osWindows;
 		}
 		
+		@Override
 		public Map<String, String> call() throws Exception {
+			LOGGER.finest("Start password scrambler execution...");
 			// look for the password scrambler. it should be next to the executable or one directory higher.
 			final Path possibleFile = findThePasswordScrambler();
-			if (!Files.exists(possibleFile)) {
-				LOGGER.severe("Password scrambler not found : \"" + possibleFile + "\"");
-				return map;
+			if (Files.exists(possibleFile)) {
+				LOGGER.finest("Path is: " + possibleFile.toString());
+			} else {
+				final String errorMessage = "Password scrambler not found : \"" + possibleFile + "\"";
+				LOGGER.severe(errorMessage);
+				throw new RuntimeException(errorMessage);				
 			}
 
 			for (final String plainPassword: map.keySet()) {
@@ -323,9 +362,17 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 				executor.setStreamHandler(streamHandler);
 				executor.setWorkingDirectory(possibleFile.getParent().toFile());
 				executor.execute(cmdLine, resultHandler);
-				resultHandler.waitFor(5000);
+				resultHandler.waitFor(60000);
 				final String result = outputStream.toString();
-				
+				if(resultHandler.getException() != null){
+					LOGGER.severe("Error while executing password-scrambler: " + resultHandler.getException().getMessage());
+					throw new RuntimeException(resultHandler.getException());
+				}
+				if(Strings.isNullOrEmpty(result)){
+					final String errorMessage = "Error while executing password-scrambler: no result.";
+					LOGGER.severe(errorMessage);
+					throw new RuntimeException(errorMessage);
+				}
 				// parse the result.
 				// example: AES128 ciphering result of nluser: 6RGXo/iJAai0tGuxtAih2Q== \n Copyright (c) 2016 Neotys, PasswordScrambler v-
 				final String firstPart = result.substring(result.indexOf(plainPassword + ":"));
@@ -336,7 +383,7 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 				
 				map.put(plainPassword, hashedPassword);
 			}
-			
+			LOGGER.finest(map.size() + " passwords has been hashed");
 			return map;
 		}
 
@@ -374,7 +421,8 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 		}
 	}
 
-	private void setupReports(final List<String> commands) {
+	private void setupReports(final List<String> commands, final Launcher launcher) {
+		final String workspaceVariable = isOsWindows(launcher) ? "%WORKSPACE%" : "${WORKSPACE}";
 		if (Boolean.valueOf(isReportType("reportTypeCustom"))) {
 			final List<String> reportPaths = PluginUtils.removeAllEmpties(htmlReport, xmlReport, pdfReport);
 			final String reportFileNames = Joiner.on(",").skipNulls().join(reportPaths);
@@ -387,8 +435,8 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 			}
 
 		} else {
-			commands.add("-report \"${WORKSPACE}/neoload-report/report.html,${WORKSPACE}/neoload-report/report.xml\"");
-			commands.add("-SLAJUnitResults \"${WORKSPACE}/neoload-report/junit-sla-results.xml\"");
+			commands.add("-report \"" + workspaceVariable + "/neoload-report/report.html," + workspaceVariable + "/neoload-report/report.xml\"");
+			commands.add("-SLAJUnitResults \"" + workspaceVariable + "/neoload-report/junit-sla-results.xml\"");
 		}
 	}
 
@@ -502,12 +550,12 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 
 		return commandInterpreter.perform(build, launcher, listener);
 	}
-
-	private boolean isOsWindows(Launcher launcher) {
+	
+	private static boolean isOsWindows(final Launcher launcher) {
 		return !launcher.isUnix();
 	}
 
-	private void addNTSArguments(final List<String> commands, final NTSServerInfo n, final Map<String, String> hashedPasswords) {
+	private static void addNTSArguments(final List<String> commands, final NTSServerInfo n, final Map<String, String> hashedPasswords) {
 		commands.add("-NTS \"" + n.getUrl() + "\"");
 		commands.add("-NTSLogin \"" + n.getLoginUser() + ":" + 
 				hashedPasswords.get(n.getLoginPassword()) + "\"");
@@ -697,25 +745,10 @@ public class NeoBuildAction extends CommandInterpreter implements NeoLoadPluginO
 			return true;
 		}
 		public FormValidation doCheckLocalProjectFile(@QueryParameter("localProjectFile") final String localProjectFile) {
-			final FormValidation requiredWarning = PluginUtils.formValidationErrorToWarning(FormValidation.validateRequired(localProjectFile));
-			if (!FormValidation.Kind.OK.equals(requiredWarning.kind)) {
-				return requiredWarning;
-			}
-			
-			if (localProjectFile == null || !localProjectFile.toLowerCase().endsWith(".nlp")) {
-				return FormValidation.error("Please specify an NLP file");
-			}
-
-			return PluginUtils.validateFileExists(localProjectFile);
+			return PluginUtils.validateFileExists(localProjectFile, ".nlp", true, false);		
 		}
-		public FormValidation doCheckExecutable(@QueryParameter final String executable) {
-			// we force a missing file to be a warning instead of an error (because it might be on a remote machine? to be tested.)
-			final FormValidation requiredWarning = PluginUtils.formValidationErrorToWarning(FormValidation.validateRequired(executable));
-			if (!FormValidation.Kind.OK.equals(requiredWarning.kind)) {
-				return requiredWarning;
-			}
-
-			return PluginUtils.formValidationErrorToWarning(FormValidation.validateExecutable(executable));
+		public FormValidation doCheckExecutable(@QueryParameter final String executable) {			
+			return PluginUtils.validateFileExists(executable, ".exe", false, true);			
 		}
 		public FormValidation doCheckLicenseVUCount(@QueryParameter final String licenseVUCount) {
 			return PluginUtils.formValidationErrorToWarning(FormValidation.validatePositiveInteger(licenseVUCount));
